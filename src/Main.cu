@@ -2,8 +2,6 @@
 #include "device_launch_parameters.h"
 #include "Init.cuh"
 #include "OneSweep.cuh"
-#include "cub/device/device_radix_sort.cuh"
-#include "cub/agent/agent_radix_sort_onesweep.cuh"
 #include <stdio.h>
 
 const int sizeExponent = 28;
