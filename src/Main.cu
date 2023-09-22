@@ -2,6 +2,8 @@
 #include "device_launch_parameters.h"
 #include "Init.cuh"
 #include "OneSweep.cuh"
+#include "cub/device/device_radix_sort.cuh"
+#include "cub/agent/agent_radix_sort_onesweep.cuh"
 #include <stdio.h>
 
 const int sizeExponent = 28;
@@ -33,10 +35,19 @@ unsigned int* secPassHistogram;
 unsigned int* thirdPassHistogram;
 unsigned int* fourthPassHistogram;
 
+void InitMemory()
+{
+	cudaMemset(index, 0, radixPasses * sizeof(unsigned int));
+	cudaMemset(globalHistogram, 0, radix * radixPasses * sizeof(unsigned int));
+	cudaMemset(firstPassHistogram, 0, radix * binningThreadblocks * sizeof(unsigned int));
+	cudaMemset(secPassHistogram, 0, radix * binningThreadblocks * sizeof(unsigned int));
+	cudaMemset(thirdPassHistogram, 0, radix * binningThreadblocks * sizeof(unsigned int));
+	cudaMemset(fourthPassHistogram, 0, radix * binningThreadblocks * sizeof(unsigned int));
+}
+
 void DispatchKernels()
 {
-	k_Init <<<256, 1024>>> (globalHistogram, firstPassHistogram, secPassHistogram, thirdPassHistogram,
-		fourthPassHistogram, index, size, radix, radixPasses, binningThreadblocks);
+	InitMemory();
 
 	k_GlobalHistogram <<<globalHistThreadblocks, globalHistDim>>> (sort, globalHistogram, size);
 
@@ -126,7 +137,7 @@ int main()
 {
 	cudaMalloc(&sort, size * sizeof(unsigned int));
 	cudaMalloc(&alt, size * sizeof(unsigned int));
-	cudaMalloc(&index, size * sizeof(unsigned int));
+	cudaMalloc(&index, radixPasses * sizeof(unsigned int));
 	cudaMalloc(&globalHistogram, radix * radixPasses * sizeof(unsigned int));
 	cudaMalloc(&firstPassHistogram, binningThreadblocks * radix * sizeof(unsigned int));
 	cudaMalloc(&secPassHistogram, binningThreadblocks * radix * sizeof(unsigned int));

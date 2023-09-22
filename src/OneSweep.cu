@@ -44,51 +44,51 @@
 using namespace cooperative_groups;
 
 //General macros
-#define LANE_COUNT			32		//Threads in a warp
-#define LANE_MASK			31		//Mask of the lane count
-#define LANE_LOG			5		//log2(LANE_COUNT)
+#define LANE_COUNT          32      //Threads in a warp
+#define LANE_MASK           31      //Mask of the lane count
+#define LANE_LOG            5       //log2(LANE_COUNT)
 
-#define RADIX				256		//Number of digit bins
-#define RADIX_MASK			255		//Mask of digit bins, to extract digits
-#define RADIX_LOG			8		//log2(RADIX)
+#define RADIX               256     //Number of digit bins
+#define RADIX_MASK          255     //Mask of digit bins, to extract digits
+#define RADIX_LOG           8       //log2(RADIX)
 
-#define SEC_RADIX			8		//shift value to retrieve digits from the second place
-#define THIRD_RADIX			16		//shift value to retrieve digits from the second place
-#define FOURTH_RADIX		24		//shift value to retrieve digits from the second place
+#define SEC_RADIX           8       //shift value to retrieve digits from the second place
+#define THIRD_RADIX         16      //shift value to retrieve digits from the second place
+#define FOURTH_RADIX        24      //shift value to retrieve digits from the second place
 
-#define SEC_RADIX_START		256		//Offset for retrieving value from global histogram buffer
-#define THIRD_RADIX_START	512		//Offset for retrieving value from global histogram buffer
-#define FOURTH_RADIX_START	768		//Offset for retrieving value from global histogram buffer
+#define SEC_RADIX_START     256     //Offset for retrieving value from global histogram buffer
+#define THIRD_RADIX_START   512     //Offset for retrieving value from global histogram buffer
+#define FOURTH_RADIX_START  768     //Offset for retrieving value from global histogram buffer
 
-#define LANE				threadIdx.x								//Lane of a thread
-#define WARP_INDEX			threadIdx.y								//Warp of a thread
-#define THREAD_ID			(LANE + (WARP_INDEX << LANE_LOG))		//Threadid
+#define LANE                threadIdx.x                             //Lane of a thread
+#define WARP_INDEX          threadIdx.y                             //Warp of a thread
+#define THREAD_ID           (LANE + (WARP_INDEX << LANE_LOG))       //Threadid
 
 //For the upfront global histogram kernel
-#define G_HIST_WARPS        8										//Warps per threadblock in k_GlobalHistogram
-#define G_HIST_THREADS		256										//Threads per threadblock in k_GlobalHistogram
-#define G_TBLOCK_LOG		11										//log2(gridDim.x)
-#define G_HIST_PART_SIZE    (size >> G_TBLOCK_LOG)					//Partition tile size in k_GlobalHistogram
-#define G_HIST_PART_START   (blockIdx.x * G_HIST_PART_SIZE)			//Starting offset of a partition tile
+#define G_HIST_WARPS        8                                       //Warps per threadblock in k_GlobalHistogram
+#define G_HIST_THREADS      256                                     //Threads per threadblock in k_GlobalHistogram
+#define G_TBLOCK_LOG        11                                      //log2(gridDim.x)
+#define G_HIST_PART_SIZE    (size >> G_TBLOCK_LOG)                  //Partition tile size in k_GlobalHistogram
+#define G_HIST_PART_START   (blockIdx.x * G_HIST_PART_SIZE)         //Starting offset of a partition tile
 #define G_HIST_PART_END     (blockIdx.x == gridDim.x - 1 ? \
                             size : \
-							(blockIdx.x + 1) * G_HIST_PART_SIZE)
+                            (blockIdx.x + 1) * G_HIST_PART_SIZE)
 
 //For the digit binning
-#define BIN_PART_SIZE		7680									//Partition tile size in k_DigitBinning
-#define BIN_HISTS_SIZE		4096									//Total size of warp histograms in shared memory in k_DigitBinning
-#define BIN_SUB_PART_SIZE	480										//Subpartition tile size of a single warp in k_DigitBinning
-#define BIN_THREADS			512										//Threads per threadblock in k_DigitBinning
-#define BIN_WARPS			16										//Warps per threadblock in k_DigitBinning
-#define BIN_KEYS_PER_THREAD	15										//Keys per thread in k_DigitBinning
-#define BIN_SUB_PART_START	(WARP_INDEX * BIN_SUB_PART_SIZE)		//Starting offset of a subpartition tile
-#define BIN_PART_START		(partitionIndex * BIN_PART_SIZE)		//Starting offset of a partition tile
+#define BIN_PART_SIZE       7680                                    //Partition tile size in k_DigitBinning
+#define BIN_HISTS_SIZE      4096                                    //Total size of warp histograms in shared memory in k_DigitBinning
+#define BIN_SUB_PART_SIZE   480                                     //Subpartition tile size of a single warp in k_DigitBinning
+#define BIN_THREADS         512                                     //Threads per threadblock in k_DigitBinning
+#define BIN_WARPS           16                                      //Warps per threadblock in k_DigitBinning
+#define BIN_KEYS_PER_THREAD 15                                      //Keys per thread in k_DigitBinning
+#define BIN_SUB_PART_START  (WARP_INDEX * BIN_SUB_PART_SIZE)        //Starting offset of a subpartition tile
+#define BIN_PART_START      (partitionIndex * BIN_PART_SIZE)        //Starting offset of a partition tile
 
 //for the chained scan with decoupled lookback
-#define FLAG_NOT_READY		0										//Flag value inidicating neither inclusive sum, nor reduction of a partition tile is ready
-#define FLAG_REDUCTION		1										//Flag value indicating reduction of a partition tile is ready
-#define FLAG_INCLUSIVE		2										//Flag value indicating inclusive sum of a partition tile is ready
-#define FLAG_MASK			3										//Mask used to retrieve flag values
+#define FLAG_NOT_READY      0                                       //Flag value inidicating neither inclusive sum, nor reduction of a partition tile is ready
+#define FLAG_REDUCTION      1                                       //Flag value indicating reduction of a partition tile is ready
+#define FLAG_INCLUSIVE      2                                       //Flag value indicating inclusive sum of a partition tile is ready
+#define FLAG_MASK           3                                       //Mask used to retrieve flag values
 
 __device__ __forceinline__ void InclusiveWarpScan(volatile unsigned int* t, int index, int strideLog)
 {
@@ -203,7 +203,7 @@ __global__ void k_DigitBinning(unsigned int* globalHistogram, unsigned int* sort
 	int partitionIndex = s_localHistogram[0];
 	__syncthreads();
 
-	//load global histogram into registers
+	//load global histogram into shared memory
 	if(THREAD_ID < RADIX)
 		s_localHistogram[THREAD_ID] = globalHistogram[THREAD_ID + (radixShift << 5)];
 
@@ -219,23 +219,21 @@ __global__ void k_DigitBinning(unsigned int* globalHistogram, unsigned int* sort
 		keys[i] = sort[t];
 
 	//WLMS
-	unsigned int _offsets[BIN_KEYS_PER_THREAD & 1 ? (BIN_KEYS_PER_THREAD >> 1) + 1 : BIN_KEYS_PER_THREAD];
+	unsigned int _offsets[(BIN_KEYS_PER_THREAD >> 1) + (BIN_KEYS_PER_THREAD & 1 ? 1 : 0)];
 	unsigned short* offsets = reinterpret_cast<unsigned short*>(_offsets);
+	for (int i = 0; i < BIN_KEYS_PER_THREAD; ++i)
 	{
-		for (int i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+		unsigned int warpFlags = 0xffffffff;
+		for (int k = radixShift; k < radixShift + RADIX_LOG; ++k)
 		{
-			unsigned int warpFlags = 0xffffffff;
-			for (int k = radixShift; k < radixShift + RADIX_LOG; ++k)
-			{
-				const bool t2 = keys[i] >> k & 1;
-				warpFlags &= (t2 ? 0 : 0xffffffff) ^ __ballot_sync(0xffffffff, t2);
-			}
-
-			const unsigned int bits = __popc(warpFlags << LANE_MASK - LANE);
-			offsets[i] = s_warpHist[keys[i] >> radixShift & RADIX_MASK] + bits - 1;
-			if (bits == 1)
-				s_warpHist[keys[i] >> radixShift & RADIX_MASK] += __popc(warpFlags);
+			const bool t2 = keys[i] >> k & 1;
+			warpFlags &= (t2 ? 0 : 0xffffffff) ^ __ballot_sync(0xffffffff, t2);
 		}
+
+		const unsigned int bits = __popc(warpFlags << LANE_MASK - LANE);
+		offsets[i] = s_warpHist[keys[i] >> radixShift & RADIX_MASK] + bits - 1;
+		if (bits == 1)
+			s_warpHist[keys[i] >> radixShift & RADIX_MASK] += __popc(warpFlags);
 	}
 	__syncthreads();
 	
@@ -329,10 +327,8 @@ __global__ void k_DigitBinning(unsigned int* globalHistogram, unsigned int* sort
 	__syncthreads();
 
 	//scatter runs of keys into device memory
-	{
-		for (int i = THREAD_ID; i < BIN_PART_SIZE; i += BIN_THREADS)
-			alt[s_localHistogram[s_warpHistograms[i] >> radixShift & RADIX_MASK] + i] = s_warpHistograms[i];
-	}
+	for (int i = THREAD_ID; i < BIN_PART_SIZE; i += BIN_THREADS)
+		alt[s_localHistogram[s_warpHistograms[i] >> radixShift & RADIX_MASK] + i] = s_warpHistograms[i];
 	
 	//To handle input sizes not perfect multiples of the partition tile size
 	if (partitionIndex == gridDim.x - 1)

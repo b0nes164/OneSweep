@@ -10,26 +10,6 @@
 #define LCG_STEP            (z4 * 1664525 + 1013904223U)
 #define HYBRID_TAUS         (z1 ^ z2 ^ z3 ^ z4)
 
-//Wipe the buffers
-__global__ void k_Init(unsigned int* globalHistogram, unsigned int* firstPassHistogram, unsigned int* secPassHistogram,
-	unsigned int* thirdPassHistogram, unsigned int* fourthPassHistogram, unsigned int* index, int size, int radix, int radixPasses,
-	int threadblocks)
-{
-	if (threadIdx.x < radixPasses && blockIdx.x == 0)
-		index[threadIdx.x] = 0;
-
-	if (threadIdx.x + blockDim.x * blockIdx.x < radix * radixPasses)
-		globalHistogram[threadIdx.x + blockDim.x * blockIdx.x] = 0;
-
-	for (int i = threadIdx.x + blockDim.x * blockIdx.x; i < threadblocks * radix; i += blockDim.x * gridDim.x)
-	{
-		firstPassHistogram[i] = 0;
-		secPassHistogram[i] = 0;
-		thirdPassHistogram[i] = 0;
-		fourthPassHistogram[i] = 0;
-	}
-}
-
 //Initialize the input to a sequence of descending integers.
 __global__ void k_InitDescending(unsigned int* sort, int size)
 {
