@@ -6,25 +6,21 @@
 #include "cub/agent/agent_radix_sort_onesweep.cuh"
 #include <stdio.h>
 
-const int sizeExponent = 28;
-const int size = 1 << sizeExponent;
-const int testIterations = 50;
+const int size = (1 << 28);
+const int testIterations = 100;
 
 //Disable this when increasing test iterations, otherwise will be too slow
 //because of the device to host readback speed
-const int performValidation = true;
+const int performValidation = false;
 
 const int radix = 256;
 const int radixPasses = 4;
 const int partitionSize = 7680;
-const int globalHistThreadblocks = 2048;
-const int binningThreadblocks = size / partitionSize;
-
-const int laneCount = 32;
-const int globalHistWarps = 8;
-const int digitBinWarps = 16;
-dim3 globalHistDim(laneCount, globalHistWarps, 1);
-dim3 digitBinDim(laneCount, digitBinWarps, 1);
+const int globalHistPartitionSize = 65536;
+const int globalHistThreads = 128;
+const int binningThreads = 512;			//2080 super seems to really like 512 
+const int binningThreadblocks = (size + partitionSize - 1) / partitionSize;
+const int globalHistThreadblocks = (size + globalHistPartitionSize - 1) / globalHistPartitionSize;
 
 unsigned int* sort;
 unsigned int* alt;
@@ -49,18 +45,20 @@ void DispatchKernels()
 {
 	InitMemory();
 
-	k_GlobalHistogram <<<globalHistThreadblocks, globalHistDim>>> (sort, globalHistogram, size);
+	cudaDeviceSynchronize();
 
-	k_DigitBinning <<<binningThreadblocks, digitBinDim>>> (globalHistogram, sort, alt,
+	k_GlobalHistogram <<<globalHistThreadblocks, globalHistThreads >>> (sort, globalHistogram, size);
+
+	k_DigitBinning <<<binningThreadblocks, binningThreads >>> (globalHistogram, sort, alt,
 		firstPassHistogram, index, size, 0);
 
-	k_DigitBinning <<<binningThreadblocks, digitBinDim>>> (globalHistogram, alt, sort,
+	k_DigitBinning <<<binningThreadblocks, binningThreads >>> (globalHistogram, alt, sort,
 		secPassHistogram, index, size, 8);
 
-	k_DigitBinning <<<binningThreadblocks, digitBinDim>>> (globalHistogram, sort, alt,
+	k_DigitBinning <<<binningThreadblocks, binningThreads >>> (globalHistogram, sort, alt,
 		thirdPassHistogram, index, size, 16);
 
-	k_DigitBinning <<<binningThreadblocks, digitBinDim>>> (globalHistogram, alt, sort,
+	k_DigitBinning <<<binningThreadblocks, binningThreads >>> (globalHistogram, alt, sort,
 		fourthPassHistogram, index, size, 24);
 }
 
@@ -113,6 +111,7 @@ void TimingTest()
 	for (int i = 0; i <= testIterations; ++i)
 	{
 		k_InitRandom <<<256, 1024>>> (sort, size, i);
+		cudaDeviceSynchronize();
 		cudaEventRecord(start);
 		DispatchKernels();
 		cudaEventRecord(stop);

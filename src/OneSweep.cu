@@ -35,50 +35,24 @@
  *
  ******************************************************************************/
 
-#include "cuda_runtime.h"
-#include "device_launch_parameters.h"
-#include <stdio.h>
-#include <cooperative_groups.h>
-#include <cooperative_groups/details/partitioning.h>
-
-using namespace cooperative_groups;
-
-//General macros
-#define LANE_COUNT          32      //Threads in a warp
-#define LANE_MASK           31      //Mask of the lane count
-#define LANE_LOG            5       //log2(LANE_COUNT)
+#include "OneSweep.cuh"
 
 #define RADIX               256     //Number of digit bins
 #define RADIX_MASK          255     //Mask of digit bins, to extract digits
 #define RADIX_LOG           8       //log2(RADIX)
 
-#define SEC_RADIX           8       //shift value to retrieve digits from the second place
-#define THIRD_RADIX         16      //shift value to retrieve digits from the second place
-#define FOURTH_RADIX        24      //shift value to retrieve digits from the second place
-
 #define SEC_RADIX_START     256     //Offset for retrieving value from global histogram buffer
 #define THIRD_RADIX_START   512     //Offset for retrieving value from global histogram buffer
 #define FOURTH_RADIX_START  768     //Offset for retrieving value from global histogram buffer
 
-#define LANE                threadIdx.x                             //Lane of a thread
-#define WARP_INDEX          threadIdx.y                             //Warp of a thread
-#define THREAD_ID           (LANE + (WARP_INDEX << LANE_LOG))       //Threadid
-
 //For the upfront global histogram kernel
-#define G_HIST_WARPS        8                                       //Warps per threadblock in k_GlobalHistogram
-#define G_HIST_THREADS      256                                     //Threads per threadblock in k_GlobalHistogram
-#define G_TBLOCK_LOG        11                                      //log2(gridDim.x)
-#define G_HIST_PART_SIZE    (size >> G_TBLOCK_LOG)                  //Partition tile size in k_GlobalHistogram
-#define G_HIST_PART_START   (blockIdx.x * G_HIST_PART_SIZE)         //Starting offset of a partition tile
-#define G_HIST_PART_END     (blockIdx.x == gridDim.x - 1 ? \
-                            size : \
-                            (blockIdx.x + 1) * G_HIST_PART_SIZE)
+#define G_HIST_PART_SIZE	65536
+#define G_HIST_VEC_SIZE		16384
 
 //For the digit binning
 #define BIN_PART_SIZE       7680                                    //Partition tile size in k_DigitBinning
 #define BIN_HISTS_SIZE      4096                                    //Total size of warp histograms in shared memory in k_DigitBinning
 #define BIN_SUB_PART_SIZE   480                                     //Subpartition tile size of a single warp in k_DigitBinning
-#define BIN_THREADS         512                                     //Threads per threadblock in k_DigitBinning
 #define BIN_WARPS           16                                      //Warps per threadblock in k_DigitBinning
 #define BIN_KEYS_PER_THREAD 15                                      //Keys per thread in k_DigitBinning
 #define BIN_SUB_PART_START  (WARP_INDEX * BIN_SUB_PART_SIZE)        //Starting offset of a subpartition tile
@@ -90,46 +64,15 @@ using namespace cooperative_groups;
 #define FLAG_INCLUSIVE      2                                       //Flag value indicating inclusive sum of a partition tile is ready
 #define FLAG_MASK           3                                       //Mask used to retrieve flag values
 
-__device__ __forceinline__ void InclusiveWarpScan(volatile unsigned int* t, int index, int strideLog)
+__global__ void k_GlobalHistogram(uint32_t* sort, uint32_t* globalHistogram, uint32_t size)
 {
-	if (LANE > 0) t[index] += t[index - (1 << strideLog)];
-	if (LANE > 1) t[index] += t[index - (2 << strideLog)];
-	if (LANE > 3) t[index] += t[index - (4 << strideLog)];
-	if (LANE > 7) t[index] += t[index - (8 << strideLog)];
-	if (LANE > 15) t[index] += t[index - (16 << strideLog)];
-}
+	__shared__ uint32_t s_globalHistFirst[RADIX * 2];
+	__shared__ uint32_t s_globalHistSec[RADIX * 2];
+	__shared__ uint32_t s_globalHistThird[RADIX * 2];
+	__shared__ uint32_t s_globalHistFourth[RADIX * 2];
 
-__device__ __forceinline__ void InclusiveWarpScanCircularShift(volatile unsigned int* t, int index)
-{
-	if (LANE > 0) t[index] += t[index - 1];
-	if (LANE > 1) t[index] += t[index - 2];
-	if (LANE > 3) t[index] += t[index - 4];
-	if (LANE > 7) t[index] += t[index - 8];
-	if (LANE > 15) t[index] += t[index - 16];
-
-	t[index] = __shfl_sync(__activemask(), t[index], LANE + LANE_MASK & LANE_MASK);
-}
-
-__device__ __forceinline__ void ExclusiveWarpScan(volatile unsigned int* t, int index, int strideLog)
-{
-	if (LANE > 0) t[index] += t[index - (1 << strideLog)];
-	if (LANE > 1) t[index] += t[index - (2 << strideLog)];
-	if (LANE > 3) t[index] += t[index - (4 << strideLog)];
-	if (LANE > 7) t[index] += t[index - (8 << strideLog)];
-	if (LANE > 15) t[index] += t[index - (16 << strideLog)];
-
-	t[index] = LANE ? t[index - (1 << strideLog)] : 0;
-}
-
-__global__ void k_GlobalHistogram(unsigned int* sort, unsigned int* globalHistogram, int size)
-{
-	__shared__ unsigned int s_globalHistFirst[RADIX];
-	__shared__ unsigned int s_globalHistSec[RADIX];
-	__shared__ unsigned int s_globalHistThird[RADIX];
-	__shared__ unsigned int s_globalHistFourth[RADIX];
-
-	//clear
-	for (int i = THREAD_ID; i < RADIX; i += G_HIST_THREADS)
+	//clear shared memory
+	for (uint32_t i = threadIdx.x; i < RADIX * 2; i += blockDim.x)
 	{
 		s_globalHistFirst[i] = 0;
 		s_globalHistSec[i] = 0;
@@ -137,237 +80,308 @@ __global__ void k_GlobalHistogram(unsigned int* sort, unsigned int* globalHistog
 		s_globalHistFourth[i] = 0;
 	}
 	__syncthreads();
-
-	//Histogram
+	
+	//histogram
 	{
-		const int partitionEnd = G_HIST_PART_END;
-		for (int i = THREAD_ID + G_HIST_PART_START; i < partitionEnd; i += G_HIST_THREADS)
+		//64 threads : 1 histogram in shared memory
+		uint32_t* s_wavesHistFirst = &s_globalHistFirst[threadIdx.x / 64 * RADIX];
+		uint32_t* s_wavesHistSec = &s_globalHistSec[threadIdx.x / 64 * RADIX];
+		uint32_t* s_wavesHistThird = &s_globalHistThird[threadIdx.x / 64 * RADIX];
+		uint32_t* s_wavesHistFourth = &s_globalHistFourth[threadIdx.x / 64 * RADIX];
+
+		if (blockIdx.x < gridDim.x - 1)
 		{
-			const unsigned int key = sort[i];
-			atomicAdd(&s_globalHistFirst[key & RADIX_MASK], 1);
-			atomicAdd(&s_globalHistSec[key >> SEC_RADIX & RADIX_MASK], 1);
-			atomicAdd(&s_globalHistThird[key >> THIRD_RADIX & RADIX_MASK], 1);
-			atomicAdd(&s_globalHistFourth[key >> FOURTH_RADIX], 1);
+			const uint32_t partEnd = (blockIdx.x + 1) * G_HIST_VEC_SIZE;
+			for (uint32_t i = threadIdx.x + (blockIdx.x * G_HIST_VEC_SIZE); i < partEnd; i += blockDim.x)
+			{
+				uint4 t[1] = { reinterpret_cast<uint4*>(sort)[i] };
+
+				atomicAdd(&s_wavesHistFirst[reinterpret_cast<uint8_t*>(t)[0]], 1);
+				atomicAdd(&s_wavesHistSec[reinterpret_cast<uint8_t*>(t)[1]], 1);
+				atomicAdd(&s_wavesHistThird[reinterpret_cast<uint8_t*>(t)[2]], 1);
+				atomicAdd(&s_wavesHistFourth[reinterpret_cast<uint8_t*>(t)[3]], 1);
+
+				atomicAdd(&s_wavesHistFirst[reinterpret_cast<uint8_t*>(t)[4]], 1);
+				atomicAdd(&s_wavesHistSec[reinterpret_cast<uint8_t*>(t)[5]], 1);
+				atomicAdd(&s_wavesHistThird[reinterpret_cast<uint8_t*>(t)[6]], 1);
+				atomicAdd(&s_wavesHistFourth[reinterpret_cast<uint8_t*>(t)[7]], 1);
+
+				atomicAdd(&s_wavesHistFirst[reinterpret_cast<uint8_t*>(t)[8]], 1);
+				atomicAdd(&s_wavesHistSec[reinterpret_cast<uint8_t*>(t)[9]], 1);
+				atomicAdd(&s_globalHistThird[reinterpret_cast<uint8_t*>(t)[10]], 1);
+				atomicAdd(&s_wavesHistFourth[reinterpret_cast<uint8_t*>(t)[11]], 1);
+
+				atomicAdd(&s_wavesHistFirst[reinterpret_cast<uint8_t*>(t)[12]], 1);
+				atomicAdd(&s_wavesHistSec[reinterpret_cast<uint8_t*>(t)[13]], 1);
+				atomicAdd(&s_wavesHistThird[reinterpret_cast<uint8_t*>(t)[14]], 1);
+				atomicAdd(&s_wavesHistFourth[reinterpret_cast<uint8_t*>(t)[15]], 1);
+			}
+		}
+
+		if (blockIdx.x == gridDim.x - 1)
+		{
+			for (uint32_t i = threadIdx.x + (blockIdx.x * G_HIST_PART_SIZE); i < size; i += blockDim.x)
+			{
+				uint32_t t[1] = { sort[i] };
+				atomicAdd(&s_wavesHistFirst[reinterpret_cast<uint8_t*>(t)[0]], 1);
+				atomicAdd(&s_wavesHistSec[reinterpret_cast<uint8_t*>(t)[1]], 1);
+				atomicAdd(&s_wavesHistThird[reinterpret_cast<uint8_t*>(t)[2]], 1);
+				atomicAdd(&s_wavesHistFourth[reinterpret_cast<uint8_t*>(t)[3]], 1);
+			}
 		}
 	}
 	__syncthreads();
+
+	//reduce to the first hist
+	for (uint32_t i = threadIdx.x; i < RADIX; i += blockDim.x)
+	{
+		s_globalHistFirst[i] += s_globalHistFirst[i + RADIX];
+		s_globalHistSec[i] += s_globalHistSec[i + RADIX];
+		s_globalHistThird[i] += s_globalHistThird[i + RADIX];
+		s_globalHistFourth[i] += s_globalHistFourth[i + RADIX];
+	}
 
 	//exclusive prefix sum over the counts
-	for (int i = THREAD_ID; i < RADIX; i += G_HIST_THREADS)
+	for (uint32_t i = threadIdx.x; i < RADIX; i += blockDim.x)
 	{
-		InclusiveWarpScanCircularShift(s_globalHistFirst, i);
-		InclusiveWarpScanCircularShift(s_globalHistSec, i);
-		InclusiveWarpScanCircularShift(s_globalHistThird, i);
-		InclusiveWarpScanCircularShift(s_globalHistFourth, i);
+		s_globalHistFirst[i] = InclusiveWarpScanCircularShift(s_globalHistFirst[i]);
+		s_globalHistSec[i] = InclusiveWarpScanCircularShift(s_globalHistSec[i]);
+		s_globalHistThird[i] = InclusiveWarpScanCircularShift(s_globalHistThird[i]);
+		s_globalHistFourth[i] = InclusiveWarpScanCircularShift(s_globalHistFourth[i]);
 	}
 	__syncthreads();
 
-	if (LANE < (RADIX >> LANE_LOG) && WARP_INDEX == 0)
+	if (threadIdx.x < (RADIX >> LANE_LOG))
 	{
-		InclusiveWarpScan(s_globalHistFirst, (LANE << LANE_LOG), LANE_LOG);
-		InclusiveWarpScan(s_globalHistSec, (LANE << LANE_LOG), LANE_LOG);
-		InclusiveWarpScan(s_globalHistThird, (LANE << LANE_LOG), LANE_LOG);
-		InclusiveWarpScan(s_globalHistFourth, (LANE << LANE_LOG), LANE_LOG);
+		s_globalHistFirst[threadIdx.x << LANE_LOG] = ActiveExclusiveWarpScan(s_globalHistFirst[threadIdx.x << LANE_LOG]);
+		s_globalHistSec[threadIdx.x << LANE_LOG] = ActiveExclusiveWarpScan(s_globalHistSec[threadIdx.x << LANE_LOG]);
+		s_globalHistThird[threadIdx.x << LANE_LOG] = ActiveExclusiveWarpScan(s_globalHistThird[threadIdx.x << LANE_LOG]);
+		s_globalHistFourth[threadIdx.x << LANE_LOG] = ActiveExclusiveWarpScan(s_globalHistFourth[threadIdx.x << LANE_LOG]);
 	}
 	__syncthreads();
-
+	
 	//Atomically add to device memory
+	for (uint32_t i = threadIdx.x; i < RADIX; i += blockDim.x)
 	{
-		int i = THREAD_ID;
-		atomicAdd(&globalHistogram[i], (LANE ? s_globalHistFirst[i] : 0) + (WARP_INDEX ? __shfl_sync(0xffffffff, s_globalHistFirst[i - LANE_COUNT], 0) : 0));
-		atomicAdd(&globalHistogram[i + SEC_RADIX_START], (LANE ? s_globalHistSec[i] : 0) + (WARP_INDEX ? __shfl_sync(0xffffffff, s_globalHistSec[i - LANE_COUNT], 0) : 0));
-		atomicAdd(&globalHistogram[i + THIRD_RADIX_START], (LANE ? s_globalHistThird[i] : 0) + (WARP_INDEX ? __shfl_sync(0xffffffff, s_globalHistThird[i - LANE_COUNT], 0) : 0));
-		atomicAdd(&globalHistogram[i + FOURTH_RADIX_START], (LANE ? s_globalHistFourth[i] : 0) + (WARP_INDEX ? __shfl_sync(0xffffffff, s_globalHistFourth[i - LANE_COUNT], 0) : 0));
-
-		for (i += G_HIST_THREADS; i < RADIX; i += G_HIST_THREADS)
-		{
-			atomicAdd(&globalHistogram[i], (LANE ? s_globalHistFirst[i] : 0) + __shfl_sync(0xffffffff, s_globalHistFirst[i - LANE_COUNT], 0));
-			atomicAdd(&globalHistogram[i + SEC_RADIX_START], (LANE ? s_globalHistSec[i] : 0) + __shfl_sync(0xffffffff, s_globalHistSec[i - LANE_COUNT], 0));
-			atomicAdd(&globalHistogram[i + THIRD_RADIX_START], (LANE ? s_globalHistThird[i] : 0) + __shfl_sync(0xffffffff, s_globalHistThird[i - LANE_COUNT], 0));
-			atomicAdd(&globalHistogram[i + FOURTH_RADIX_START], (LANE ? s_globalHistFourth[i] : 0) + __shfl_sync(0xffffffff, s_globalHistFourth[i - LANE_COUNT], 0));
-		}
+		atomicAdd(&globalHistogram[i], s_globalHistFirst[i] + (getLaneId() ? __shfl_sync(0xfffffffe, s_globalHistFirst[i - 1], 1) : 0));
+		atomicAdd(&globalHistogram[i + SEC_RADIX_START], s_globalHistSec[i] + (getLaneId() ? __shfl_sync(0xfffffffe, s_globalHistSec[i - 1], 1) : 0));
+		atomicAdd(&globalHistogram[i + THIRD_RADIX_START], s_globalHistThird[i] + (getLaneId() ? __shfl_sync(0xfffffffe, s_globalHistThird[i - 1], 1) : 0));
+		atomicAdd(&globalHistogram[i + FOURTH_RADIX_START], s_globalHistFourth[i] + (getLaneId() ? __shfl_sync(0xfffffffe, s_globalHistFourth[i - 1], 1) : 0));
 	}
 }
 
-__global__ void k_DigitBinning(unsigned int* globalHistogram, unsigned int* sort, unsigned int* alt,
-	volatile unsigned int* passHistogram, unsigned int* index, int size, unsigned int radixShift)
+__global__ void k_DigitBinning(uint32_t* globalHistogram, uint32_t* sort, uint32_t* alt,
+	volatile uint32_t* passHistogram, uint32_t* index, uint32_t size, uint32_t radixShift)
 {
-	__shared__ unsigned int s_warpHistograms[BIN_PART_SIZE];
-	__shared__ unsigned int s_localHistogram[RADIX];
-	unsigned int* s_warpHist = &s_warpHistograms[WARP_INDEX << RADIX_LOG];
+	__shared__ uint32_t s_warpHistograms[BIN_PART_SIZE];
+	__shared__ uint32_t s_localHistogram[RADIX];
+	volatile uint32_t* s_warpHist = &s_warpHistograms[WARP_INDEX << RADIX_LOG];
+
+	//clear shared memory
+	for (uint32_t i = threadIdx.x; i < BIN_HISTS_SIZE; i += blockDim.x)  //unnecessary work for last partion but still a win to avoid another barrier
+		s_warpHistograms[i] = 0;
 
 	//atomically assign partition tiles
-	if (LANE == 0 && WARP_INDEX == 0)
-		s_localHistogram[0] = atomicAdd(&index[radixShift >> 3], 1);
+	if (threadIdx.x == 0)
+		s_warpHistograms[BIN_PART_SIZE - 1] = atomicAdd(&index[radixShift >> 3], 1);
 	__syncthreads();
-	int partitionIndex = s_localHistogram[0];
-	__syncthreads();
+	const uint32_t partitionIndex = s_warpHistograms[BIN_PART_SIZE - 1];
 
 	//load global histogram into shared memory
-	if(THREAD_ID < RADIX)
-		s_localHistogram[THREAD_ID] = globalHistogram[THREAD_ID + (radixShift << 5)];
+	if(threadIdx.x < RADIX)
+		s_localHistogram[threadIdx.x] = globalHistogram[threadIdx.x + (radixShift << 5)];
 
-	//clear
-	#pragma unroll
-	for (int i = LANE; i < RADIX; i += LANE_COUNT)
-		s_warpHist[i] = 0;
-
-	//load keys
-	unsigned int keys[BIN_KEYS_PER_THREAD];
-	#pragma unroll
-	for (int i = 0, t = LANE + BIN_SUB_PART_START + BIN_PART_START; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT)
-		keys[i] = sort[t];
-
-	//WLMS
-	unsigned int _offsets[(BIN_KEYS_PER_THREAD >> 1) + (BIN_KEYS_PER_THREAD & 1 ? 1 : 0)];
-	unsigned short* offsets = reinterpret_cast<unsigned short*>(_offsets);
-	for (int i = 0; i < BIN_KEYS_PER_THREAD; ++i)
-	{
-		unsigned int warpFlags = 0xffffffff;
-		for (int k = radixShift; k < radixShift + RADIX_LOG; ++k)
-		{
-			const bool t2 = keys[i] >> k & 1;
-			warpFlags &= (t2 ? 0 : 0xffffffff) ^ __ballot_sync(0xffffffff, t2);
-		}
-
-		const unsigned int bits = __popc(warpFlags << LANE_MASK - LANE);
-		offsets[i] = s_warpHist[keys[i] >> radixShift & RADIX_MASK] + bits - 1;
-		if (bits == 1)
-			s_warpHist[keys[i] >> radixShift & RADIX_MASK] += __popc(warpFlags);
-	}
-	__syncthreads();
-	
-	//exclusive prefix sum across the warp histograms
-	if(THREAD_ID < RADIX)
-	{
-		const unsigned int t = THREAD_ID;
-		for (int i = t + RADIX; i < BIN_HISTS_SIZE; i += RADIX)
-		{
-			s_warpHistograms[t] += s_warpHistograms[i];
-			s_warpHistograms[i] = s_warpHistograms[t] - s_warpHistograms[i];
-		}
-
-		if (partitionIndex == 0)
-			atomicAdd((unsigned int*)&passHistogram[THREAD_ID * gridDim.x + partitionIndex], FLAG_INCLUSIVE | s_warpHistograms[THREAD_ID] << 2);
-		else
-			atomicAdd((unsigned int*)&passHistogram[THREAD_ID * gridDim.x + partitionIndex], FLAG_REDUCTION | s_warpHistograms[THREAD_ID] << 2);
-	}
-	__syncthreads();
-
-	//exlusive prefix sum across the reductions
-	if (THREAD_ID < RADIX)
-		InclusiveWarpScanCircularShift(s_warpHistograms, THREAD_ID);
-	__syncthreads();
-
-	if (LANE < (RADIX >> LANE_LOG) && WARP_INDEX == 0)
-		ExclusiveWarpScan(s_warpHistograms, LANE << LANE_LOG, LANE_LOG);
-	__syncthreads();
-
-	if (THREAD_ID < RADIX && LANE)
-		s_warpHistograms[THREAD_ID] += __shfl_sync(0xfffffffe, s_warpHistograms[THREAD_ID - 1], 1);
-	__syncthreads();
-
-	//update offsets
-	if (WARP_INDEX)
-	{
-		#pragma unroll 
-		for (int i = 0; i < BIN_KEYS_PER_THREAD; ++i)
-		{
-			const unsigned int t2 = keys[i] >> radixShift & RADIX_MASK;
-			offsets[i] += s_warpHist[t2] + s_warpHistograms[t2];
-		}
-	}
-	else
-	{
-		#pragma unroll
-		for (int i = 0; i < BIN_KEYS_PER_THREAD; ++i)
-			offsets[i] += s_warpHistograms[keys[i] >> radixShift & RADIX_MASK];
-	}
-	__syncthreads();
-
-	//split the warps into single thread cooperative groups and lookback
-	if (partitionIndex)
-	{
-		thread_block_tile<1> threadID = tiled_partition<1>(this_thread_block());
-
-		for (int i = threadID.meta_group_rank(); i < RADIX; i += BIN_THREADS)
-		{
-			unsigned int reduction = 0;
-			for (int k = partitionIndex - 1; 0 <= k;)
-			{
-				const unsigned int flagPayload = passHistogram[i * gridDim.x + k];
-
-				if ((flagPayload & FLAG_MASK) == FLAG_INCLUSIVE)
-				{
-					reduction += flagPayload >> 2;
-					atomicAdd((unsigned int*)&passHistogram[i * gridDim.x + partitionIndex], 1 | (reduction << 2));
-					s_localHistogram[i] += reduction - s_warpHistograms[i];
-					break;
-				}
-
-				if ((flagPayload & FLAG_MASK) == FLAG_REDUCTION)
-				{
-					reduction += flagPayload >> 2;
-					k--;
-				}
-			}
-		}
-	}
-	else
-	{
-		if (THREAD_ID < RADIX)
-			s_localHistogram[THREAD_ID] -= s_warpHistograms[THREAD_ID];
-	}
-	__syncthreads();
-
-	//scatter keys into shared memory
-	#pragma unroll
-	for (int i = 0; i < BIN_KEYS_PER_THREAD; ++i)
-		s_warpHistograms[offsets[i]] = keys[i];
-	__syncthreads();
-
-	//scatter runs of keys into device memory
-	for (int i = THREAD_ID; i < BIN_PART_SIZE; i += BIN_THREADS)
-		alt[s_localHistogram[s_warpHistograms[i] >> radixShift & RADIX_MASK] + i] = s_warpHistograms[i];
-	
 	//To handle input sizes not perfect multiples of the partition tile size
-	if (partitionIndex == gridDim.x - 1)
+	if (partitionIndex < gridDim.x - 1)
 	{
-		__syncthreads();
-		{
-			const int tid = THREAD_ID;
-			if (tid < RADIX)
-				s_localHistogram[tid] = (passHistogram[tid * gridDim.x + partitionIndex] >> 2) + globalHistogram[tid + (radixShift << 5)];
-		}
-		__syncthreads();
+		//load keys
+		uint32_t keys[BIN_KEYS_PER_THREAD];
+		#pragma unroll
+		for (uint32_t i = 0, t = getLaneId() + BIN_SUB_PART_START + BIN_PART_START; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT)
+			keys[i] = sort[t];
 
-		partitionIndex++;
-		for (int i = THREAD_ID + BIN_PART_START; i < size; i += BIN_THREADS)
-		{
-			const unsigned int key = sort[i];
-			unsigned int offset = 0xffffffff;
+		uint32_t _offsets[(BIN_KEYS_PER_THREAD >> 1) + (BIN_KEYS_PER_THREAD & 1 ? 1 : 0)];
+		uint16_t* offsets = reinterpret_cast<uint16_t*>(_offsets);
 
+		//WLMS
+		#pragma unroll
+		for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+		{
+			unsigned warpFlags = 0xffffffff;
 			for (int k = radixShift; k < radixShift + RADIX_LOG; ++k)
 			{
-				const bool t = key >> k & 1;
-				offset &= (t ? 0 : 0xffffffff) ^ __ballot_sync(__activemask(), t);
+				const bool t2 = keys[i] >> k & 1;
+				warpFlags &= (t2 ? 0 : 0xffffffff) ^ __ballot_sync(0xffffffff, t2);
 			}
 
-			#pragma unroll
-			for (int k = 0; k < BIN_WARPS; ++k)
+			const uint32_t bits = __popc(warpFlags & getLaneMaskLt());
+
+			uint32_t preIncrementVal;
+			if(bits == 0)
+				preIncrementVal = atomicAdd((uint32_t*)&s_warpHist[keys[i] >> radixShift & RADIX_MASK], __popc(warpFlags));
+
+			offsets[i] = __shfl_sync(0xffffffff, preIncrementVal, __ffs(warpFlags) - 1) + bits;
+
+			//CUB version
+			/*
+			offsets[i] = s_warpHist[keys[i] >> radixShift & RADIX_MASK] + bits;
+			__syncwarp(0xffffffff);
+			if (bits == 0)
+				s_warpHist[keys[i] >> radixShift & RADIX_MASK] += __popc(warpFlags);
+			__syncwarp(0xffffffff);
+			*/
+		}
+		__syncthreads();
+
+		//exclusive prefix sum up the warp histograms
+		if (threadIdx.x < RADIX)
+		{
+			uint32_t reduction = s_warpHistograms[threadIdx.x];
+			for (uint32_t i = threadIdx.x + RADIX; i < BIN_HISTS_SIZE; i += RADIX)
 			{
-				if (WARP_INDEX == k)
+				reduction += s_warpHistograms[i];
+				s_warpHistograms[i] = reduction - s_warpHistograms[i];
+			}
+
+			atomicAdd((uint32_t*)&passHistogram[threadIdx.x * gridDim.x + partitionIndex], (partitionIndex ? FLAG_REDUCTION : FLAG_INCLUSIVE) | reduction << 2);
+
+			//begin the exclusive prefix sum across the reductions
+			s_warpHistograms[threadIdx.x] = InclusiveWarpScanCircularShift(reduction);
+		}
+		__syncthreads();
+
+		if (threadIdx.x < (RADIX >> LANE_LOG))
+			s_warpHistograms[threadIdx.x << LANE_LOG] = ActiveExclusiveWarpScan(s_warpHistograms[threadIdx.x << LANE_LOG]);
+		__syncthreads();
+
+		if (threadIdx.x < RADIX && getLaneId())
+			s_warpHistograms[threadIdx.x] += __shfl_sync(0xfffffffe, s_warpHistograms[threadIdx.x - 1], 1);
+		__syncthreads();
+
+		//update offsets
+		if (WARP_INDEX)
+		{
+			#pragma unroll 
+			for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+			{
+				const unsigned int t2 = keys[i] >> radixShift & RADIX_MASK;
+				offsets[i] += s_warpHist[t2] + s_warpHistograms[t2];
+			}
+		}
+		else
+		{
+			#pragma unroll
+			for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+				offsets[i] += s_warpHistograms[keys[i] >> radixShift & RADIX_MASK];
+		}
+
+		//split the warps into single thread cooperative groups and lookback
+		if (partitionIndex)
+		{
+			for (uint32_t i = threadIdx.x; i < RADIX; i += blockDim.x)
+			{
+				uint32_t reduction = 0;
+				for (uint32_t k = partitionIndex; k > 0; )
 				{
-					const unsigned int t = s_localHistogram[key >> radixShift & RADIX_MASK];
-					const unsigned int bits = __popc(offset << LANE_MASK - LANE);
-					if (bits == 1)
-						s_localHistogram[key >> radixShift & RADIX_MASK] += __popc(offset);
-					offset = t + bits - 1;
+					const uint32_t flagPayload = passHistogram[i * gridDim.x + k - 1];
+
+					if ((flagPayload & FLAG_MASK) == FLAG_INCLUSIVE)
+					{
+						reduction += flagPayload >> 2;
+						atomicAdd((uint32_t*)&passHistogram[i * gridDim.x + partitionIndex], 1 | (reduction << 2));
+						s_localHistogram[i] += reduction - s_warpHistograms[i];
+						break;
+					}
+
+					if ((flagPayload & FLAG_MASK) == FLAG_REDUCTION)
+					{
+						reduction += flagPayload >> 2;
+						k--;
+					}
 				}
+			}
+		}
+		else
+		{
+			if (threadIdx.x < RADIX)
+				s_localHistogram[threadIdx.x] -= s_warpHistograms[threadIdx.x];
+		}
+		__syncthreads();
+
+		//scatter keys into shared memory
+		#pragma unroll
+		for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+			s_warpHistograms[offsets[i]] = keys[i];
+		__syncthreads();
+
+		//scatter runs of keys into device memory
+		for (uint32_t i = threadIdx.x; i < BIN_PART_SIZE; i += blockDim.x)
+			alt[s_localHistogram[s_warpHistograms[i] >> radixShift & RADIX_MASK] + i] = s_warpHistograms[i];
+	}
+	
+	//Process the final partition slightly differently
+	if(partitionIndex == gridDim.x - 1)
+	{
+		__syncthreads();
+
+		//immediately begin lookback
+		if (partitionIndex)
+		{
+			for (uint32_t i = threadIdx.x; i < RADIX; i += blockDim.x)
+			{
+				uint32_t reduction = 0;
+				for (uint32_t k = partitionIndex; k > 0; )
+				{
+					const uint32_t flagPayload = passHistogram[i * gridDim.x + k - 1];
+
+					if ((flagPayload & FLAG_MASK) == FLAG_INCLUSIVE)
+					{
+						reduction += flagPayload >> 2;
+						s_localHistogram[i] += reduction;
+						break;
+					}
+
+					if ((flagPayload & FLAG_MASK) == FLAG_REDUCTION)
+					{
+						reduction += flagPayload >> 2;
+						k--;
+					}
+				}
+			}
+			__syncthreads();
+		}
+
+		const uint32_t partEnd = BIN_PART_START + BIN_PART_SIZE;
+		for (uint32_t i = threadIdx.x + BIN_PART_START; i < partEnd; i += blockDim.x)
+		{
+			uint32_t key;
+			uint32_t offset;
+			unsigned warpFlags = 0xffffffff;
+
+			if(i < size)
+				key = sort[i];
+
+			for (uint32_t k = radixShift; k < radixShift + RADIX_LOG; ++k)
+			{
+				const bool t = key >> k & 1;
+				warpFlags &= (t ? 0 : 0xffffffff) ^ __ballot_sync(0xffffffff, t);
+			}
+			const uint32_t bits = __popc(warpFlags & getLaneMaskLt());
+
+			#pragma unroll
+			for (uint32_t k = 0; k < BIN_WARPS; ++k)
+			{
+				uint32_t preIncrementVal;
+				if (WARP_INDEX == k && bits == 0 && i < size)
+					preIncrementVal = atomicAdd(&s_localHistogram[key >> radixShift & RADIX_MASK], __popc(warpFlags));
+
+				if (WARP_INDEX == k)
+					offset = __shfl_sync(0xffffffff, preIncrementVal, __ffs(warpFlags) - 1) + bits;
 				__syncthreads();
 			}
 
-			alt[offset] = key;
+			if(i < size)
+				alt[offset] = key;
 		}
 	}
 }
@@ -375,5 +389,5 @@ __global__ void k_DigitBinning(unsigned int* globalHistogram, unsigned int* sort
 __global__ void k_Print(unsigned int* toPrint, int size)
 {
 	for (int i = 0; i < size; ++i)
-		printf("%d: %u \n", i, toPrint[i]);
+		printf("%d: %u \n", i, toPrint[i] & 255);
 }
