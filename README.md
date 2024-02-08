@@ -3,8 +3,6 @@ A simple library-less CUDA implementation of the Adinets and Merrill's [OneSweep
 
 The purpose of this repo is to demystify the implmentation of the algorithm. It is not intended for production or use, instead a proper implementation can be found at the [CUB](https://github.com/NVIDIA/cub) library. Notably our implementation lacks: short circuit evaluation, support for data types besides `unsigned int`, support for aligned scattering, and tuning for cards other than the 2080 super.
 
-Some interesting notes for those wishing to port OneSweep to other languages besides CUDA. The performance of the algorithm is significantly impacted by the use of cooperative groups during the lookback. Without this, the performance (at least in CUDA) is on par with a well tuned Reduce-Then-Scan approach.
-
 ## Strongly Suggested Reading / Bibliography 
 Andy Adinets and Duane Merrill. Onesweep: A Faster Least Significant Digit Radix Sort for GPUs. 2022. arXiv: 2206.01784 [cs.DC]
 
