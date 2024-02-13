@@ -200,28 +200,28 @@ __global__ void k_DigitBinning(uint32_t* globalHistogram, uint32_t* sort, uint32
 		for (uint32_t i = 0, t = getLaneId() + BIN_SUB_PART_START + BIN_PART_START; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT)
 			keys[i] = sort[t];
 
-		uint32_t _offsets[(BIN_KEYS_PER_THREAD >> 1) + (BIN_KEYS_PER_THREAD & 1 ? 1 : 0)];
-		uint16_t* offsets = reinterpret_cast<uint16_t*>(_offsets);
+		uint16_t offsets[BIN_KEYS_PER_THREAD];
 
 		//WLMS
 		#pragma unroll
 		for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
 		{
 			unsigned warpFlags = 0xffffffff;
-			for (int k = radixShift; k < radixShift + RADIX_LOG; ++k)
+			#pragma unroll
+			for (int k = 0; k < RADIX_LOG; ++k)
 			{
-				const bool t2 = keys[i] >> k & 1;
+				const bool t2 = keys[i] >> k + radixShift & 1;
 				warpFlags &= (t2 ? 0 : 0xffffffff) ^ __ballot_sync(0xffffffff, t2);
 			}
 
 			const uint32_t bits = __popc(warpFlags & getLaneMaskLt());
-
+			
 			uint32_t preIncrementVal;
 			if(bits == 0)
 				preIncrementVal = atomicAdd((uint32_t*)&s_warpHist[keys[i] >> radixShift & RADIX_MASK], __popc(warpFlags));
 
 			offsets[i] = __shfl_sync(0xffffffff, preIncrementVal, __ffs(warpFlags) - 1) + bits;
-
+			
 			//CUB version
 			/*
 			offsets[i] = s_warpHist[keys[i] >> radixShift & RADIX_MASK] + bits;
@@ -276,20 +276,20 @@ __global__ void k_DigitBinning(uint32_t* globalHistogram, uint32_t* sort, uint32
 		}
 
 		//split the warps into single thread cooperative groups and lookback
-		if (partitionIndex)
+		if (threadIdx.x < RADIX)
 		{
-			for (uint32_t i = threadIdx.x; i < RADIX; i += blockDim.x)
+			if (partitionIndex)
 			{
 				uint32_t reduction = 0;
 				for (uint32_t k = partitionIndex; k > 0; )
 				{
-					const uint32_t flagPayload = passHistogram[i * gridDim.x + k - 1];
+					const uint32_t flagPayload = passHistogram[threadIdx.x * gridDim.x + k - 1];
 
 					if ((flagPayload & FLAG_MASK) == FLAG_INCLUSIVE)
 					{
 						reduction += flagPayload >> 2;
-						atomicAdd((uint32_t*)&passHistogram[i * gridDim.x + partitionIndex], 1 | (reduction << 2));
-						s_localHistogram[i] += reduction - s_warpHistograms[i];
+						atomicAdd((uint32_t*)&passHistogram[threadIdx.x * gridDim.x + partitionIndex], 1 | (reduction << 2));
+						s_localHistogram[threadIdx.x] += reduction - s_warpHistograms[threadIdx.x];
 						break;
 					}
 
@@ -300,11 +300,10 @@ __global__ void k_DigitBinning(uint32_t* globalHistogram, uint32_t* sort, uint32
 					}
 				}
 			}
-		}
-		else
-		{
-			if (threadIdx.x < RADIX)
+			else
+			{
 				s_localHistogram[threadIdx.x] -= s_warpHistograms[threadIdx.x];
+			}
 		}
 		__syncthreads();
 
@@ -315,6 +314,7 @@ __global__ void k_DigitBinning(uint32_t* globalHistogram, uint32_t* sort, uint32
 		__syncthreads();
 
 		//scatter runs of keys into device memory
+		#pragma unroll BIN_KEYS_PER_THREAD
 		for (uint32_t i = threadIdx.x; i < BIN_PART_SIZE; i += blockDim.x)
 			alt[s_localHistogram[s_warpHistograms[i] >> radixShift & RADIX_MASK] + i] = s_warpHistograms[i];
 	}
@@ -324,20 +324,20 @@ __global__ void k_DigitBinning(uint32_t* globalHistogram, uint32_t* sort, uint32
 	{
 		__syncthreads();
 
-		//immediately begin lookback
 		if (partitionIndex)
 		{
-			for (uint32_t i = threadIdx.x; i < RADIX; i += blockDim.x)
+			//immediately begin lookback
+			if (threadIdx.x < RADIX)
 			{
 				uint32_t reduction = 0;
 				for (uint32_t k = partitionIndex; k > 0; )
 				{
-					const uint32_t flagPayload = passHistogram[i * gridDim.x + k - 1];
+					const uint32_t flagPayload = passHistogram[threadIdx.x * gridDim.x + k - 1];
 
 					if ((flagPayload & FLAG_MASK) == FLAG_INCLUSIVE)
 					{
 						reduction += flagPayload >> 2;
-						s_localHistogram[i] += reduction;
+						s_localHistogram[threadIdx.x] += reduction;
 						break;
 					}
 
@@ -350,7 +350,7 @@ __global__ void k_DigitBinning(uint32_t* globalHistogram, uint32_t* sort, uint32
 			}
 			__syncthreads();
 		}
-
+		
 		const uint32_t partEnd = BIN_PART_START + BIN_PART_SIZE;
 		for (uint32_t i = threadIdx.x + BIN_PART_START; i < partEnd; i += blockDim.x)
 		{
@@ -361,9 +361,10 @@ __global__ void k_DigitBinning(uint32_t* globalHistogram, uint32_t* sort, uint32
 			if(i < size)
 				key = sort[i];
 
-			for (uint32_t k = radixShift; k < radixShift + RADIX_LOG; ++k)
+			#pragma unroll
+			for (uint32_t k = 0; k < RADIX_LOG; ++k)
 			{
-				const bool t = key >> k & 1;
+				const bool t = key >> k + radixShift & 1;
 				warpFlags &= (t ? 0 : 0xffffffff) ^ __ballot_sync(0xffffffff, t);
 			}
 			const uint32_t bits = __popc(warpFlags & getLaneMaskLt());

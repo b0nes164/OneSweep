@@ -7,11 +7,11 @@
 #include <stdio.h>
 
 const int size = (1 << 28);
-const int testIterations = 100;
+const int testIterations = 25;
 
 //Disable this when increasing test iterations, otherwise will be too slow
 //because of the device to host readback speed
-const int performValidation = false;
+const int performValidation = true;
 
 const int radix = 256;
 const int radixPasses = 4;

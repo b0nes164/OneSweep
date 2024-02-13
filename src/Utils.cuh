@@ -28,7 +28,7 @@ __device__ __forceinline__ unsigned getLaneMaskLt()
 //Warp scans
 __device__ __forceinline__ uint32_t InclusiveWarpScan(uint32_t val)
 {
-#pragma unroll
+	#pragma unroll
 	for (int i = 1; i <= 16; i <<= 1) // 16 = LANE_COUNT >> 1
 	{
 		const uint32_t t = __shfl_up_sync(0xffffffff, val, i, 32);
@@ -41,7 +41,7 @@ __device__ __forceinline__ uint32_t InclusiveWarpScan(uint32_t val)
 __device__ __forceinline__ uint32_t ActiveInclusiveWarpScan(uint32_t val)
 {
 	const uint32_t mask = __activemask();
-#pragma unroll
+	#pragma unroll
 	for (int i = 1; i <= 16; i <<= 1)
 	{
 		const uint32_t t = __shfl_up_sync(mask, val, i, 32);
@@ -66,7 +66,7 @@ __device__ __forceinline__ uint32_t InclusiveWarpScanCircularShift(uint32_t val)
 __device__ __forceinline__ uint32_t ActiveInclusiveWarpScanCircularShift(uint32_t val)
 {
 	const uint32_t mask = __activemask();
-#pragma unroll
+	#pragma unroll
 	for (int i = 1; i <= 16; i <<= 1) // 16 = LANE_COUNT >> 1
 	{
 		const uint32_t t = __shfl_up_sync(mask, val, i, 32);
@@ -78,7 +78,7 @@ __device__ __forceinline__ uint32_t ActiveInclusiveWarpScanCircularShift(uint32_
 
 __device__ __forceinline__ uint32_t ExclusiveWarpScan(uint32_t val)
 {
-#pragma unroll
+	#pragma unroll
 	for (int i = 1; i <= 16; i <<= 1) // 16 = LANE_COUNT >> 1
 	{
 		const uint32_t t = __shfl_up_sync(0xffffffff, val, i, 32);
@@ -92,7 +92,7 @@ __device__ __forceinline__ uint32_t ExclusiveWarpScan(uint32_t val)
 __device__ __forceinline__ uint32_t ActiveExclusiveWarpScan(uint32_t val)
 {
 	const uint32_t mask = __activemask();
-#pragma unroll
+	#pragma unroll
 	for (int i = 1; i <= 16; i <<= 1) // 16 = LANE_COUNT >> 1
 	{
 		const uint32_t t = __shfl_up_sync(mask, val, i, 32);
