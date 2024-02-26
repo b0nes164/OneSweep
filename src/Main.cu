@@ -1,44 +1,42 @@
+#include <stdio.h>
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include "Init.cuh"
 #include "OneSweep.cuh"
-#include "cub/device/device_radix_sort.cuh"
-#include "cub/agent/agent_radix_sort_onesweep.cuh"
-#include <stdio.h>
 
-const int size = (1 << 28);
-const int testIterations = 25;
+const uint32_t size = (1 << 28);
+const uint32_t testIterations = 25;
 
 //Disable this when increasing test iterations, otherwise will be too slow
 //because of the device to host readback speed
-const int performValidation = true;
+const uint32_t performValidation = true;
 
-const int radix = 256;
-const int radixPasses = 4;
-const int partitionSize = 7680;
-const int globalHistPartitionSize = 65536;
-const int globalHistThreads = 128;
-const int binningThreads = 512;			//2080 super seems to really like 512 
-const int binningThreadblocks = (size + partitionSize - 1) / partitionSize;
-const int globalHistThreadblocks = (size + globalHistPartitionSize - 1) / globalHistPartitionSize;
+const uint32_t radix = 256;
+const uint32_t radixPasses = 4;
+const uint32_t partitionSize = 7680;
+const uint32_t globalHistPartitionSize = 65536;
+const uint32_t globalHistThreads = 128;
+const uint32_t binningThreads = 512;			//2080 super seems to really like 512 
+const uint32_t binningThreadblocks = (size + partitionSize - 1) / partitionSize;
+const uint32_t globalHistThreadblocks = (size + globalHistPartitionSize - 1) / globalHistPartitionSize;
 
-unsigned int* sort;
-unsigned int* alt;
-unsigned int* index;
-unsigned int* globalHistogram;
-unsigned int* firstPassHistogram;
-unsigned int* secPassHistogram;
-unsigned int* thirdPassHistogram;
-unsigned int* fourthPassHistogram;
+uint32_t* sort;
+uint32_t* alt;
+uint32_t* index;
+uint32_t* globalHistogram;
+uint32_t* firstPassHistogram;
+uint32_t* secPassHistogram;
+uint32_t* thirdPassHistogram;
+uint32_t* fourthPassHistogram;
 
 void InitMemory()
 {
-	cudaMemset(index, 0, radixPasses * sizeof(unsigned int));
-	cudaMemset(globalHistogram, 0, radix * radixPasses * sizeof(unsigned int));
-	cudaMemset(firstPassHistogram, 0, radix * binningThreadblocks * sizeof(unsigned int));
-	cudaMemset(secPassHistogram, 0, radix * binningThreadblocks * sizeof(unsigned int));
-	cudaMemset(thirdPassHistogram, 0, radix * binningThreadblocks * sizeof(unsigned int));
-	cudaMemset(fourthPassHistogram, 0, radix * binningThreadblocks * sizeof(unsigned int));
+	cudaMemset(index, 0, radixPasses * sizeof(uint32_t));
+	cudaMemset(globalHistogram, 0, radix * radixPasses * sizeof(uint32_t));
+	cudaMemset(firstPassHistogram, 0, radix * binningThreadblocks * sizeof(uint32_t));
+	cudaMemset(secPassHistogram, 0, radix * binningThreadblocks * sizeof(uint32_t));
+	cudaMemset(thirdPassHistogram, 0, radix * binningThreadblocks * sizeof(uint32_t));
+	cudaMemset(fourthPassHistogram, 0, radix * binningThreadblocks * sizeof(uint32_t));
 }
 
 void DispatchKernels()
@@ -47,37 +45,40 @@ void DispatchKernels()
 
 	cudaDeviceSynchronize();
 
-	k_GlobalHistogram <<<globalHistThreadblocks, globalHistThreads >>> (sort, globalHistogram, size);
+	GlobalHistogram <<<globalHistThreadblocks, globalHistThreads >>> (sort, globalHistogram, size);
 
-	k_DigitBinning <<<binningThreadblocks, binningThreads >>> (globalHistogram, sort, alt,
-		firstPassHistogram, index, size, 0);
+	Scan <<<radixPasses, radix >>> (globalHistogram, firstPassHistogram, secPassHistogram,
+		thirdPassHistogram, fourthPassHistogram);
 
-	k_DigitBinning <<<binningThreadblocks, binningThreads >>> (globalHistogram, alt, sort,
-		secPassHistogram, index, size, 8);
+	DigitBinningPass <<<binningThreadblocks, binningThreads >>> (sort, alt, firstPassHistogram,
+		index, size, 0);
 
-	k_DigitBinning <<<binningThreadblocks, binningThreads >>> (globalHistogram, sort, alt,
-		thirdPassHistogram, index, size, 16);
+	DigitBinningPass <<<binningThreadblocks, binningThreads >>> (alt, sort, secPassHistogram,
+		index, size, 8);
 
-	k_DigitBinning <<<binningThreadblocks, binningThreads >>> (globalHistogram, alt, sort,
-		fourthPassHistogram, index, size, 24);
+	DigitBinningPass <<<binningThreadblocks, binningThreads >>> (sort, alt, thirdPassHistogram,
+		index, size, 16);
+
+	DigitBinningPass <<<binningThreadblocks, binningThreads >>> (alt, sort, fourthPassHistogram,
+		index, size, 24);
 }
 
 //Test for correctness
 void ValidationTest()
 {
 	printf("Beginning VALIDATION tests at size %u and %u iterations. \n", size, testIterations);
-	unsigned int* validationArray = new unsigned int[size];
+	uint32_t* validationArray = new uint32_t[size];
 	int testsPassed = 0;
 
-	for (int i = 1; i <= testIterations; ++i)
+	for (uint32_t i = 1; i <= testIterations; ++i)
 	{
-		k_InitRandom <<<256, 1024>>> (sort, size, i);
+		InitRandom <<<256, 1024>>> (sort, size, i);
 		DispatchKernels();
 		cudaDeviceSynchronize();
-		cudaMemcpy(validationArray, sort, size * sizeof(unsigned int), cudaMemcpyDeviceToHost);
+		cudaMemcpy(validationArray, sort, size * sizeof(uint32_t), cudaMemcpyDeviceToHost);
 
 		bool isCorrect = true;
-		for (int k = 1; k < size; ++k)
+		for (uint32_t k = 1; k < size; ++k)
 		{
 			if (validationArray[k] < validationArray[k - 1])
 			{
@@ -108,9 +109,9 @@ void TimingTest()
 	cudaEventCreate(&stop);
 
 	float totalTime = 0.0f;
-	for (int i = 0; i <= testIterations; ++i)
+	for (uint32_t i = 0; i <= testIterations; ++i)
 	{
-		k_InitRandom <<<256, 1024>>> (sort, size, i);
+		InitRandom <<<256, 1024>>> (sort, size, i);
 		cudaDeviceSynchronize();
 		cudaEventRecord(start);
 		DispatchKernels();
@@ -134,14 +135,14 @@ void TimingTest()
 
 int main()
 {
-	cudaMalloc(&sort, size * sizeof(unsigned int));
-	cudaMalloc(&alt, size * sizeof(unsigned int));
-	cudaMalloc(&index, radixPasses * sizeof(unsigned int));
-	cudaMalloc(&globalHistogram, radix * radixPasses * sizeof(unsigned int));
-	cudaMalloc(&firstPassHistogram, binningThreadblocks * radix * sizeof(unsigned int));
-	cudaMalloc(&secPassHistogram, binningThreadblocks * radix * sizeof(unsigned int));
-	cudaMalloc(&thirdPassHistogram, binningThreadblocks * radix * sizeof(unsigned int));
-	cudaMalloc(&fourthPassHistogram, binningThreadblocks * radix * sizeof(unsigned int));
+	cudaMalloc(&sort, size * sizeof(uint32_t));
+	cudaMalloc(&alt, size * sizeof(uint32_t));
+	cudaMalloc(&index, radixPasses * sizeof(uint32_t));
+	cudaMalloc(&globalHistogram, radix * radixPasses * sizeof(uint32_t));
+	cudaMalloc(&firstPassHistogram, binningThreadblocks * radix * sizeof(uint32_t));
+	cudaMalloc(&secPassHistogram, binningThreadblocks * radix * sizeof(uint32_t));
+	cudaMalloc(&thirdPassHistogram, binningThreadblocks * radix * sizeof(uint32_t));
+	cudaMalloc(&fourthPassHistogram, binningThreadblocks * radix * sizeof(uint32_t));
 
 	if (performValidation)
 		ValidationTest();

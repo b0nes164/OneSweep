@@ -1,4 +1,5 @@
 #pragma once
+#include <stdint.h>
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 
@@ -12,24 +13,24 @@
 #define HYBRID_TAUS         (z1 ^ z2 ^ z3 ^ z4)
 
 //Initialize the input to a sequence of descending integers.
-__global__ void k_InitDescending(unsigned int* sort, int size)
+__global__ void InitDescending(uint32_t* sort, uint32_t size)
 {
-	for (int i = threadIdx.x + blockDim.x * blockIdx.x; i < size; i += blockDim.x * gridDim.x)
+	for (uint32_t i = threadIdx.x + blockDim.x * blockIdx.x; i < size; i += blockDim.x * gridDim.x)
 		sort[i] = size - i;
 }
 
 //Initialize the input to random integers. Because this is higher entropy than the descending sequence, and
 //becuase we do not implement short circuit evaluation, this tends to be significantly faster
-__global__ void k_InitRandom(unsigned int* sort, int size, int seed)
+__global__ void InitRandom(uint32_t* sort, uint32_t size, uint32_t seed)
 {
-	int idx = threadIdx.x + blockDim.x * blockIdx.x;
+	uint32_t idx = threadIdx.x + blockDim.x * blockIdx.x;
 
-	unsigned int z1 = (idx << 2) * seed;
-	unsigned int z2 = ((idx << 2) + 1) * seed;
-	unsigned int z3 = ((idx << 2) + 2) * seed;
-	unsigned int z4 = ((idx << 2) + 3) * seed;
+	uint32_t z1 = (idx << 2) * seed;
+	uint32_t z2 = ((idx << 2) + 1) * seed;
+	uint32_t z3 = ((idx << 2) + 2) * seed;
+	uint32_t z4 = ((idx << 2) + 3) * seed;
 
-	for (int i = threadIdx.x + blockDim.x * blockIdx.x; i < size; i += blockDim.x * gridDim.x)
+	for (uint32_t i = threadIdx.x + blockDim.x * blockIdx.x; i < size; i += blockDim.x * gridDim.x)
 	{
 		z1 = TAUS_STEP_1;
 		z2 = TAUS_STEP_2;
